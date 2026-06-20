@@ -20,19 +20,38 @@ const UPI_APPS = [
 
 const PAYMENT_LABELS = Object.fromEntries(UPI_APPS.map(u=>[u.id, u.name]));
 
-const STORAGE_KEY = "expenseai_v3";
+const STORAGE_KEY = "expenseai_v4";
+const OLD_STORAGE_KEY = "expenseai_v3";
 const DEFAULT_BUDGET = 5000;
+const INCOME_CATEGORIES = ["Salary","Freelance","Business","Rental","Interest","Gift","Refund","Other Income"];
+const INCOME_ICON = { Salary:"💼",Freelance:"💻",Business:"🏢",Rental:"🏠",Interest:"🏦",Gift:"🎁",Refund:"↩️","Other Income":"💵" };
 
 // ─── Storage ──────────────────────────────────────────────────────────────────
-function loadData() {
-  try { const r = localStorage.getItem(STORAGE_KEY); if(r) return JSON.parse(r); } catch{}
+function defaultData() {
   return {
     profile: { name:"", avatar:"😊", upiId:"", phone:"", email:"", currency:"₹", budgetAlert:80 },
     budget: DEFAULT_BUDGET,
+    categoryBudgets: {},   // { Food: 2000, Bills: 1500, ... }
     expenses: [],
+    incomes: [],
     savingsGoals: [],
     recurringExpenses: [],
   };
+}
+function loadData() {
+  try {
+    const r = localStorage.getItem(STORAGE_KEY);
+    if(r) {
+      const parsed = JSON.parse(r);
+      return { ...defaultData(), ...parsed, profile:{...defaultData().profile,...parsed.profile} };
+    }
+    const old = localStorage.getItem(OLD_STORAGE_KEY);
+    if(old) {
+      const parsed = JSON.parse(old);
+      return { ...defaultData(), ...parsed, profile:{...defaultData().profile,...parsed.profile} };
+    }
+  } catch{}
+  return defaultData();
 }
 function saveData(d) { try { localStorage.setItem(STORAGE_KEY, JSON.stringify(d)); } catch{} }
 
@@ -203,18 +222,24 @@ export default function App() {
   const [data, setData]       = useState(loadData);
   const [tab, setTab]         = useState("dashboard");
   const [toast, setToast]     = useState(null);
-  const [modals, setModals]   = useState({ add:false, goal:false, recurring:false, upi:false, filter:false, deleteConfirm:null });
+  const [modals, setModals]   = useState({ add:false, goal:false, recurring:false, upi:false, filter:false, income:false, catBudget:false, deleteConfirm:null, deleteIncomeConfirm:null });
 
   // Add/Edit form
   const blankForm = { title:"", amount:"", category:"Food", date:todayStr(), note:"", paymentMethod:"gpay", tags:"" };
   const [form, setForm]   = useState(blankForm);
   const [editId, setEditId] = useState(null);
 
+  // Income form
+  const blankIncome = { title:"", amount:"", category:"Salary", date:todayStr(), note:"" };
+  const [incomeForm, setIncomeForm] = useState(blankIncome);
+  const [editIncomeId, setEditIncomeId] = useState(null);
+
   // Filter
   const [filterMonth, setFilterMonth] = useState(nowMonth());
   const [filterCat,   setFilterCat]   = useState("All");
   const [filterPay,   setFilterPay]   = useState("All");
   const [search,      setSearch]      = useState("");
+  const [historySubTab, setHistorySubTab] = useState("expenses"); // "expenses" | "income"
 
   // AI
   const [aiMsgs,    setAiMsgs]    = useState([{ role:"assistant", content:"Hi! 👋 I'm your AI financial advisor. I can analyze your spending, suggest budgets, warn you about overspending, and help you save money. What would you like to know?" }]);
@@ -230,6 +255,9 @@ export default function App() {
   const blankRecur = { title:"", amount:"", category:"Bills", paymentMethod:"gpay", frequency:"monthly", nextDate:todayStr() };
   const [recurForm, setRecurForm] = useState(blankRecur);
 
+  // Category budget editing (temp local state while modal open)
+  const [catBudgetDraft, setCatBudgetDraft] = useState({});
+
   useEffect(()=>{ saveData(data); },[data]);
 
   // Toast helper
@@ -243,10 +271,27 @@ export default function App() {
   // Derived
   const cur        = data.profile.currency||"₹";
   const currExp    = data.expenses.filter(e=>monthKey(e.date)===nowMonth());
+  const currInc    = (data.incomes||[]).filter(e=>monthKey(e.date)===nowMonth());
   const currSpent  = currExp.reduce((a,e)=>a+e.amount,0);
+  const currIncome = currInc.reduce((a,e)=>a+e.amount,0);
+  const netSavings = currIncome - currSpent;
   const remaining  = data.budget - currSpent;
   const budgetPct  = currSpent/data.budget;
   const alertPct   = (data.profile.budgetAlert||80)/100;
+
+  // Spending prediction: linear projection based on days elapsed
+  const dayOfMonth = new Date().getDate();
+  const daysInMonth = new Date(new Date().getFullYear(), new Date().getMonth()+1, 0).getDate();
+  const projectedSpend = dayOfMonth > 0 ? (currSpent / dayOfMonth) * daysInMonth : 0;
+  const projectedOverBudget = projectedSpend > data.budget;
+
+  // Category budget derived: spend per category this month vs limit
+  const categoryBudgetStatus = Object.entries(data.categoryBudgets||{})
+    .filter(([,limit])=>limit>0)
+    .map(([catName,limit])=>{
+      const spent = currExp.filter(e=>e.category===catName).reduce((a,e)=>a+e.amount,0);
+      return { category:catName, limit, spent, pct: spent/limit };
+    });
 
   // Recurring due check
   useEffect(()=>{
@@ -267,6 +312,13 @@ export default function App() {
     .sort((a,b)=>new Date(b.date)-new Date(a.date));
 
   const filtSpent = filteredExp.reduce((a,e)=>a+e.amount,0);
+
+  const filteredIncomes = (data.incomes||[])
+    .filter(e=>monthKey(e.date)===filterMonth)
+    .filter(e=>!search||e.title.toLowerCase().includes(search.toLowerCase())||e.note?.toLowerCase().includes(search.toLowerCase()))
+    .sort((a,b)=>new Date(b.date)-new Date(a.date));
+
+  const filtIncomeTotal = filteredIncomes.reduce((a,e)=>a+e.amount,0);
 
   // category breakdown for filter month
   const catBreakdown = CATEGORIES.map(c=>({
@@ -308,6 +360,32 @@ export default function App() {
 
   const handleEdit = exp => { setForm({...exp,amount:String(exp.amount),tags:exp.tags||""}); setEditId(exp.id); openModal("add"); };
   const handleDelete = id => { setData(d=>({...d,expenses:d.expenses.filter(e=>e.id!==id)})); setModals(m=>({...m,deleteConfirm:null})); showToast("Deleted.","info"); };
+
+  // ── Income ────────────────────────────────────────────────────────────
+  const handleSaveIncome = () => {
+    if(!incomeForm.title.trim()||!incomeForm.amount||isNaN(incomeForm.amount)||Number(incomeForm.amount)<=0) {
+      showToast("Enter a valid title and amount.","error"); return;
+    }
+    if(editIncomeId) {
+      setData(d=>({...d,incomes:(d.incomes||[]).map(e=>e.id===editIncomeId?{...e,...incomeForm,amount:Number(incomeForm.amount)}:e)}));
+      setEditIncomeId(null); showToast("Income updated! ✏️");
+    } else {
+      setData(d=>({...d,incomes:[{id:Date.now(),...incomeForm,amount:Number(incomeForm.amount)},...(d.incomes||[])]}));
+      showToast("Income added! 💵");
+    }
+    setIncomeForm(blankIncome); closeModal("income");
+  };
+  const handleEditIncome = inc => { setIncomeForm({...inc,amount:String(inc.amount)}); setEditIncomeId(inc.id); openModal("income"); };
+  const handleDeleteIncome = id => { setData(d=>({...d,incomes:(d.incomes||[]).filter(e=>e.id!==id)})); setModals(m=>({...m,deleteIncomeConfirm:null})); showToast("Income removed.","info"); };
+
+  // ── Category Budgets ─────────────────────────────────────────────────
+  const openCatBudgetModal = () => { setCatBudgetDraft({...data.categoryBudgets}); openModal("catBudget"); };
+  const saveCatBudgets = () => {
+    const cleaned = {};
+    Object.entries(catBudgetDraft).forEach(([k,v])=>{ if(v && Number(v)>0) cleaned[k]=Number(v); });
+    setData(d=>({...d,categoryBudgets:cleaned}));
+    closeModal("catBudget"); showToast("Category budgets saved! 🎯");
+  };
 
   // ── Savings goals ─────────────────────────────────────────────────────
   const handleSaveGoal = () => {
@@ -361,18 +439,14 @@ export default function App() {
     const topCats=catBreakdown.slice(0,5).map(c=>`${c.label}: ${fmt(c.v,cur)}`).join(", ");
     const goals=data.savingsGoals.map(g=>`${g.name}: ${fmt(g.saved,cur)}/${fmt(g.target,cur)}`).join(", ");
     const recurring=data.recurringExpenses.map(r=>`${r.title} ${fmt(r.amount,cur)}/${r.frequency}`).join(", ");
+    const catBudgetLines = categoryBudgetStatus.map(c=>`${c.category}: ${fmt(c.spent,cur)}/${fmt(c.limit,cur)} (${Math.round(c.pct*100)}%)`).join(", ");
 
-    try {
-      const resp=await fetch("https://api.anthropic.com/v1/messages",{
-        method:"POST",
-        headers:{"Content-Type":"application/json"},
-        body:JSON.stringify({
-          model:"claude-sonnet-4-6",
-          max_tokens:1000,
-          system:`You are an expert personal finance AI advisor built into ExpenseAI, an Indian expense tracker app. You speak in a friendly, direct, helpful tone. Give concrete, actionable advice.
+    const systemPrompt = `You are an expert personal finance AI advisor built into ExpenseAI, an Indian expense tracker app. You speak in a friendly, direct, helpful tone. Give concrete, actionable advice.
 
-User profile: ${data.profile.name||"User"}, Budget: ${fmt(data.budget,cur)}/month
-Current month: Spent ${fmt(currSpent,cur)}, Remaining ${fmt(remaining,cur)}, Budget usage: ${Math.round(budgetPct*100)}%
+User profile: ${data.profile.name||"User"}, Overall Budget: ${fmt(data.budget,cur)}/month
+Current month: Spent ${fmt(currSpent,cur)}, Income ${fmt(currIncome,cur)}, Net savings ${fmt(netSavings,cur)}, Remaining budget ${fmt(remaining,cur)}, Budget usage: ${Math.round(budgetPct*100)}%
+Projected month-end spend (linear): ${fmt(projectedSpend,cur)} ${projectedOverBudget?"(projected to EXCEED budget)":"(on track)"}
+Category budgets: ${catBudgetLines||"none set"}
 Top spending categories: ${topCats||"none yet"}
 Payment methods used: ${payUsage||"none"}
 Savings goals: ${goals||"none"}
@@ -380,26 +454,36 @@ Recurring expenses: ${recurring||"none"}
 Total expenses tracked: ${data.expenses.length}
 Monthly trend (last 6 months): ${monthTrend.map(m=>`${m.label}: ${fmt(m.v,cur)}`).join(", ")}
 
-Keep responses concise (3-5 sentences). Use ₹ for amounts. Be specific and personalized.`,
+Keep responses concise (3-5 sentences). Use ₹ for amounts. Be specific and personalized.`;
+
+    try {
+      // Calls your own backend (see /server folder) which securely holds the Anthropic API key.
+      // In the Claude.ai artifact preview, this same code transparently calls the Anthropic API directly.
+      const resp=await fetch("/api/chat",{
+        method:"POST",
+        headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({
+          system: systemPrompt,
           messages:[...aiMsgs.slice(-8).map(m=>({role:m.role,content:m.content})),{role:"user",content:msg}]
         })
       });
       const d=await resp.json();
-      const text=d.content?.map(c=>c.text||"").join("")||"Sorry, I'm unable to respond right now. Try again!";
+      const text=d.content?.map(c=>c.text||"").join("")||d.error||"Sorry, I'm unable to respond right now. Try again!";
       setAiMsgs(m=>[...m,{role:"assistant",content:text}]);
     } catch {
-      setAiMsgs(m=>[...m,{role:"assistant",content:"Connection issue. Please try again!"}]);
+      setAiMsgs(m=>[...m,{role:"assistant",content:"Connection issue — make sure the backend server is running (see README). Try again!"}]);
     }
     setAiLoading(false);
   };
 
   // ── Export CSV ────────────────────────────────────────────────────────
   const exportCSV = () => {
-    const header="Date,Title,Amount,Category,Payment Method,Note\n";
-    const rows=data.expenses.map(e=>`${e.date},"${e.title}",${e.amount},${e.category},${PAYMENT_LABELS[e.paymentMethod]||e.paymentMethod},"${e.note||""}"`).join("\n");
-    const blob=new Blob([header+rows],{type:"text/csv"});
+    const expHeader="Type,Date,Title,Amount,Category,Payment Method,Note\n";
+    const expRows=data.expenses.map(e=>`Expense,${e.date},"${e.title}",${e.amount},${e.category},${PAYMENT_LABELS[e.paymentMethod]||e.paymentMethod},"${e.note||""}"`).join("\n");
+    const incRows=(data.incomes||[]).map(e=>`Income,${e.date},"${e.title}",${e.amount},${e.category},,"${e.note||""}"`).join("\n");
+    const blob=new Blob([expHeader+expRows+(incRows?"\n"+incRows:"")],{type:"text/csv"});
     const url=URL.createObjectURL(blob);
-    const a=document.createElement("a"); a.href=url; a.download="expenses.csv"; a.click();
+    const a=document.createElement("a"); a.href=url; a.download="expenseai-report.csv"; a.click();
     showToast("CSV exported! 📥");
   };
 
@@ -528,6 +612,57 @@ Keep responses concise (3-5 sentences). Use ₹ for amounts. Be specific and per
         </button>
       </Modal>
 
+      {/* Income Modal */}
+      <Modal show={modals.income} title={editIncomeId?"Edit Income":"Add Income"} onClose={()=>{closeModal("income");setEditIncomeId(null);setIncomeForm(blankIncome);}}>
+        <Input label="TITLE" icon="💵" type="text" placeholder="e.g. Monthly Salary, Freelance Project..." value={incomeForm.title} onChange={e=>setIncomeForm(f=>({...f,title:e.target.value}))}/>
+        <Input label="AMOUNT (₹)" icon="💰" type="number" placeholder="0.00" value={incomeForm.amount} onChange={e=>setIncomeForm(f=>({...f,amount:e.target.value}))}/>
+        <Input label="DATE" icon="📅" type="date" value={incomeForm.date} onChange={e=>setIncomeForm(f=>({...f,date:e.target.value}))}/>
+        <div style={{marginBottom:14}}>
+          <label style={{fontSize:11,color:"#64748b",fontWeight:700,display:"block",marginBottom:8,letterSpacing:0.5}}>SOURCE</label>
+          <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:6}}>
+            {INCOME_CATEGORIES.map(c=>(
+              <button key={c} onClick={()=>setIncomeForm(f=>({...f,category:c}))}
+                style={{padding:"8px 4px",borderRadius:10,border:`1.5px solid ${incomeForm.category===c?"#10b981":"#1e293b"}`,
+                  background:incomeForm.category===c?"#10b98122":"#0f172a",
+                  color:incomeForm.category===c?"#10b981":"#475569",fontSize:9,fontWeight:600,
+                  display:"flex",flexDirection:"column",alignItems:"center",gap:3}}>
+                <span style={{fontSize:15}}>{INCOME_ICON[c]}</span>{c}
+              </button>
+            ))}
+          </div>
+        </div>
+        <Input label="NOTE (optional)" icon="🗒️" type="text" placeholder="Add a note..." value={incomeForm.note} onChange={e=>setIncomeForm(f=>({...f,note:e.target.value}))}/>
+        <button onClick={handleSaveIncome} style={{width:"100%",padding:15,borderRadius:14,background:"linear-gradient(135deg,#10b981,#059669)",color:"#fff",border:"none",fontSize:16,fontWeight:800,marginTop:6}}>
+          {editIncomeId?"Update Income ✏️":"Add Income 💵"}
+        </button>
+      </Modal>
+
+      {/* Income delete confirm */}
+      <Modal show={!!modals.deleteIncomeConfirm} title="Delete Income?" onClose={()=>setModals(m=>({...m,deleteIncomeConfirm:null}))}>
+        <p style={{color:"#94a3b8",marginBottom:20,fontSize:14}}>This cannot be undone.</p>
+        <div style={{display:"flex",gap:10}}>
+          <button onClick={()=>setModals(m=>({...m,deleteIncomeConfirm:null}))} style={{flex:1,padding:12,borderRadius:12,background:"#1e293b",color:"#f1f5f9",border:"1px solid #334155",fontWeight:600,fontSize:14}}>Cancel</button>
+          <button onClick={()=>handleDeleteIncome(modals.deleteIncomeConfirm)} style={{flex:1,padding:12,borderRadius:12,background:"#dc2626",color:"#fff",border:"none",fontWeight:700,fontSize:14}}>Delete</button>
+        </div>
+      </Modal>
+
+      {/* Category Budgets Modal */}
+      <Modal show={modals.catBudget} title="Category Budgets" onClose={()=>closeModal("catBudget")}>
+        <p style={{color:"#64748b",fontSize:12,marginBottom:16}}>Set a monthly spending limit per category. Leave blank for no limit.</p>
+        {CATEGORIES.map(c=>(
+          <div key={c} style={{display:"flex",alignItems:"center",gap:10,marginBottom:10}}>
+            <span style={{width:32,height:32,borderRadius:9,background:CAT_COLOR[c]+"22",display:"flex",alignItems:"center",justifyContent:"center",fontSize:16,flexShrink:0}}>{CAT_ICON[c]}</span>
+            <span style={{fontSize:13,fontWeight:600,flex:1}}>{c}</span>
+            <input type="number" placeholder="No limit" value={catBudgetDraft[c]||""}
+              onChange={e=>setCatBudgetDraft(d=>({...d,[c]:e.target.value}))}
+              style={{width:110,padding:"8px 10px",borderRadius:9,background:"#020617",border:"1px solid #334155",color:"#f1f5f9",fontSize:13,textAlign:"right"}}/>
+          </div>
+        ))}
+        <button onClick={saveCatBudgets} style={{width:"100%",padding:15,borderRadius:14,background:"linear-gradient(135deg,#6366f1,#8b5cf6)",color:"#fff",border:"none",fontSize:16,fontWeight:800,marginTop:10}}>
+          Save Category Budgets 🎯
+        </button>
+      </Modal>
+
       {/* ── HEADER ── */}
       <div style={{background:"#0f172a",borderBottom:"1px solid #1e293b",padding:"14px 18px",position:"sticky",top:0,zIndex:100}}>
         <div style={{maxWidth:640,margin:"0 auto",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
@@ -566,6 +701,65 @@ Keep responses concise (3-5 sentences). Use ₹ for amounts. Be specific and per
                 {budgetPct>=1&&<div style={{fontSize:11,color:"#ef4444",marginTop:6,animation:"pulse 2s infinite"}}>🚨 Budget exceeded!</div>}
               </div>
             </div>
+
+            {/* Income vs Expense */}
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:14}}>
+              <div style={{background:"#0f172a",border:"1px solid #1e293b",borderRadius:16,padding:"14px 16px"}}>
+                <div style={{fontSize:10,color:"#10b981",fontWeight:700,letterSpacing:0.5,marginBottom:6}}>💵 INCOME</div>
+                <div style={{fontSize:18,fontWeight:800,color:"#10b981"}}>{fmt(currIncome,cur)}</div>
+                <button onClick={()=>openModal("income")} style={{marginTop:8,width:"100%",padding:"6px",borderRadius:8,background:"#10b98122",border:"1px solid #10b98144",color:"#10b981",fontSize:11,fontWeight:700}}>+ Add Income</button>
+              </div>
+              <div style={{background:"#0f172a",border:"1px solid #1e293b",borderRadius:16,padding:"14px 16px"}}>
+                <div style={{fontSize:10,color:netSavings>=0?"#6366f1":"#ef4444",fontWeight:700,letterSpacing:0.5,marginBottom:6}}>📈 NET SAVINGS</div>
+                <div style={{fontSize:18,fontWeight:800,color:netSavings>=0?"#6366f1":"#ef4444"}}>{netSavings>=0?"":"−"}{fmt(Math.abs(netSavings),cur)}</div>
+                <div style={{marginTop:8,fontSize:11,color:"#475569"}}>{currIncome>0?`${Math.round((netSavings/currIncome)*100)}% of income saved`:"Add income to see %"}</div>
+              </div>
+            </div>
+
+            {/* Spending Prediction */}
+            {dayOfMonth>=3&&currSpent>0&&(
+              <div style={{background:projectedOverBudget?"#1a0a00":"#06160f",border:`1px solid ${projectedOverBudget?"#92400e":"#065f46"}`,borderRadius:16,padding:16,marginBottom:14,display:"flex",alignItems:"center",gap:14}}>
+                <span style={{fontSize:28}}>{projectedOverBudget?"⚠️":"🔮"}</span>
+                <div style={{flex:1}}>
+                  <div style={{fontSize:12,fontWeight:700,color:projectedOverBudget?"#f59e0b":"#10b981"}}>
+                    Projected month-end: {fmt(projectedSpend,cur)}
+                  </div>
+                  <div style={{fontSize:11,color:"#64748b",marginTop:2}}>
+                    {projectedOverBudget
+                      ? `At this pace you'll exceed your ${fmt(data.budget,cur)} budget by ${fmt(projectedSpend-data.budget,cur)}`
+                      : `On track to stay within your ${fmt(data.budget,cur)} budget`}
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* Category Budgets */}
+            {categoryBudgetStatus.length>0&&(
+              <div style={{background:"#0f172a",border:"1px solid #1e293b",borderRadius:18,padding:18,marginBottom:14}}>
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12}}>
+                  <span style={{fontSize:11,color:"#64748b",fontWeight:700,letterSpacing:0.5}}>CATEGORY BUDGETS</span>
+                  <button onClick={openCatBudgetModal} style={{fontSize:11,color:"#6366f1",background:"none",border:"none",fontWeight:700}}>Edit →</button>
+                </div>
+                <div style={{display:"flex",flexDirection:"column",gap:10}}>
+                  {categoryBudgetStatus.map(c=>(
+                    <div key={c.category}>
+                      <div style={{display:"flex",justifyContent:"space-between",marginBottom:4}}>
+                        <span style={{fontSize:12,fontWeight:600}}>{CAT_ICON[c.category]} {c.category}</span>
+                        <span style={{fontSize:11,fontWeight:700,color:c.pct>=1?"#ef4444":c.pct>=0.8?"#f59e0b":"#94a3b8"}}>{fmt(c.spent,cur)} / {fmt(c.limit,cur)}</span>
+                      </div>
+                      <div style={{height:6,borderRadius:3,background:"#1e293b",overflow:"hidden"}}>
+                        <div style={{height:"100%",borderRadius:3,background:c.pct>=1?"#ef4444":c.pct>=0.8?"#f59e0b":CAT_COLOR[c.category],width:`${Math.min(c.pct*100,100)}%`,transition:"width 0.5s ease"}}/>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+            {categoryBudgetStatus.length===0&&(
+              <button onClick={openCatBudgetModal} style={{width:"100%",padding:14,borderRadius:16,background:"#0f172a",border:"1px dashed #334155",color:"#64748b",fontSize:12,fontWeight:600,marginBottom:14}}>
+                🎯 Set category-wise budgets (Food, Bills, etc.)
+              </button>
+            )}
 
             {/* Quick stats */}
             <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:10,marginBottom:14}}>
@@ -705,63 +899,119 @@ Keep responses concise (3-5 sentences). Use ₹ for amounts. Be specific and per
               <button onClick={exportCSV} style={{padding:"7px 14px",borderRadius:10,background:"#1e293b",border:"1px solid #334155",color:"#94a3b8",fontSize:12,fontWeight:600}}>📥 Export CSV</button>
             </div>
 
+            {/* Sub-tab toggle */}
+            <div style={{display:"flex",gap:6,marginBottom:14,background:"#0f172a",borderRadius:12,padding:4,border:"1px solid #1e293b"}}>
+              <button onClick={()=>setHistorySubTab("expenses")} style={{flex:1,padding:"9px 0",borderRadius:9,border:"none",fontSize:13,fontWeight:700,
+                background:historySubTab==="expenses"?"linear-gradient(135deg,#6366f1,#8b5cf6)":"transparent",color:historySubTab==="expenses"?"#fff":"#64748b"}}>
+                💸 Expenses
+              </button>
+              <button onClick={()=>setHistorySubTab("income")} style={{flex:1,padding:"9px 0",borderRadius:9,border:"none",fontSize:13,fontWeight:700,
+                background:historySubTab==="income"?"linear-gradient(135deg,#10b981,#059669)":"transparent",color:historySubTab==="income"?"#fff":"#64748b"}}>
+                💵 Income
+              </button>
+            </div>
+
             {/* Filters */}
             <div style={{display:"flex",gap:8,marginBottom:10,flexWrap:"wrap"}}>
               <select value={filterMonth} onChange={e=>setFilterMonth(e.target.value)} style={{padding:"8px 12px",borderRadius:10,background:"#0f172a",border:"1px solid #334155",color:"#f1f5f9",fontSize:12,flex:1}}>
                 {allMonths.map(m=><option key={m} value={m}>{m}</option>)}
               </select>
-              <select value={filterCat} onChange={e=>setFilterCat(e.target.value)} style={{padding:"8px 12px",borderRadius:10,background:"#0f172a",border:"1px solid #334155",color:"#f1f5f9",fontSize:12,flex:1}}>
-                <option value="All">All Categories</option>
-                {CATEGORIES.map(c=><option key={c} value={c}>{CAT_ICON[c]} {c}</option>)}
-              </select>
-              <select value={filterPay} onChange={e=>setFilterPay(e.target.value)} style={{padding:"8px 12px",borderRadius:10,background:"#0f172a",border:"1px solid #334155",color:"#f1f5f9",fontSize:12,flex:1}}>
-                <option value="All">All Payments</option>
-                {UPI_APPS.map(u=><option key={u.id} value={u.id}>{u.icon} {u.short}</option>)}
-              </select>
+              {historySubTab==="expenses"&&(<>
+                <select value={filterCat} onChange={e=>setFilterCat(e.target.value)} style={{padding:"8px 12px",borderRadius:10,background:"#0f172a",border:"1px solid #334155",color:"#f1f5f9",fontSize:12,flex:1}}>
+                  <option value="All">All Categories</option>
+                  {CATEGORIES.map(c=><option key={c} value={c}>{CAT_ICON[c]} {c}</option>)}
+                </select>
+                <select value={filterPay} onChange={e=>setFilterPay(e.target.value)} style={{padding:"8px 12px",borderRadius:10,background:"#0f172a",border:"1px solid #334155",color:"#f1f5f9",fontSize:12,flex:1}}>
+                  <option value="All">All Payments</option>
+                  {UPI_APPS.map(u=><option key={u.id} value={u.id}>{u.icon} {u.short}</option>)}
+                </select>
+              </>)}
             </div>
             <div style={{position:"relative",marginBottom:12}}>
               <span style={{position:"absolute",left:12,top:"50%",transform:"translateY(-50%)",fontSize:14}}>🔍</span>
-              <input value={search} onChange={e=>setSearch(e.target.value)} placeholder="Search expenses..."
+              <input value={search} onChange={e=>setSearch(e.target.value)} placeholder={historySubTab==="expenses"?"Search expenses...":"Search income..."}
                 style={{width:"100%",padding:"10px 12px 10px 36px",borderRadius:12,background:"#0f172a",border:"1px solid #334155",color:"#f1f5f9",fontSize:13}}/>
             </div>
 
-            {filteredExp.length>0&&(
-              <div style={{background:"#0f172a",border:"1px solid #1e293b",borderRadius:14,padding:"12px 16px",marginBottom:12,display:"flex",justifyContent:"space-between"}}>
-                <span style={{fontSize:12,color:"#64748b"}}>{filteredExp.length} transactions</span>
-                <span style={{fontSize:13,fontWeight:800,color:"#f97316"}}>{fmt(filtSpent,cur)}</span>
-              </div>
-            )}
+            {/* ── EXPENSES SUB-TAB ── */}
+            {historySubTab==="expenses"&&(<>
+              {filteredExp.length>0&&(
+                <div style={{background:"#0f172a",border:"1px solid #1e293b",borderRadius:14,padding:"12px 16px",marginBottom:12,display:"flex",justifyContent:"space-between"}}>
+                  <span style={{fontSize:12,color:"#64748b"}}>{filteredExp.length} transactions</span>
+                  <span style={{fontSize:13,fontWeight:800,color:"#f97316"}}>{fmt(filtSpent,cur)}</span>
+                </div>
+              )}
 
-            {filteredExp.length===0&&<div style={{textAlign:"center",padding:"50px 20px",color:"#475569"}}><div style={{fontSize:40}}>🔍</div><div style={{marginTop:10,color:"#64748b",fontWeight:600}}>No expenses found</div></div>}
+              {filteredExp.length===0&&<div style={{textAlign:"center",padding:"50px 20px",color:"#475569"}}><div style={{fontSize:40}}>🔍</div><div style={{marginTop:10,color:"#64748b",fontWeight:600}}>No expenses found</div></div>}
 
-            {filteredExp.map(e=>(
-              <div key={e.id} style={{background:"#0f172a",border:"1px solid #1e293b",borderRadius:14,padding:"14px 16px",marginBottom:10}}>
-                <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start"}}>
-                  <div style={{display:"flex",gap:10,alignItems:"center",flex:1,minWidth:0}}>
-                    <div style={{width:42,height:42,borderRadius:12,background:CAT_COLOR[e.category]+"22",display:"flex",alignItems:"center",justifyContent:"center",fontSize:20,flexShrink:0}}>{CAT_ICON[e.category]}</div>
-                    <div style={{flex:1,minWidth:0}}>
-                      <div style={{fontSize:14,fontWeight:700,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{e.title}</div>
-                      <div style={{display:"flex",alignItems:"center",gap:5,marginTop:3,flexWrap:"wrap"}}>
-                        <UPIBadge id={e.paymentMethod} size={16}/>
-                        <span style={{fontSize:10,color:"#475569"}}>{UPI_APPS.find(u=>u.id===e.paymentMethod)?.short}</span>
-                        <span style={{fontSize:10,color:"#334155"}}>·</span>
-                        <span style={{fontSize:10,color:"#475569"}}>{fmtDate(e.date)}</span>
-                        <span style={{fontSize:10,padding:"1px 6px",borderRadius:4,background:CAT_COLOR[e.category]+"22",color:CAT_COLOR[e.category],fontWeight:600}}>{e.category}</span>
+              {filteredExp.map(e=>(
+                <div key={e.id} style={{background:"#0f172a",border:"1px solid #1e293b",borderRadius:14,padding:"14px 16px",marginBottom:10}}>
+                  <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start"}}>
+                    <div style={{display:"flex",gap:10,alignItems:"center",flex:1,minWidth:0}}>
+                      <div style={{width:42,height:42,borderRadius:12,background:CAT_COLOR[e.category]+"22",display:"flex",alignItems:"center",justifyContent:"center",fontSize:20,flexShrink:0}}>{CAT_ICON[e.category]}</div>
+                      <div style={{flex:1,minWidth:0}}>
+                        <div style={{fontSize:14,fontWeight:700,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{e.title}</div>
+                        <div style={{display:"flex",alignItems:"center",gap:5,marginTop:3,flexWrap:"wrap"}}>
+                          <UPIBadge id={e.paymentMethod} size={16}/>
+                          <span style={{fontSize:10,color:"#475569"}}>{UPI_APPS.find(u=>u.id===e.paymentMethod)?.short}</span>
+                          <span style={{fontSize:10,color:"#334155"}}>·</span>
+                          <span style={{fontSize:10,color:"#475569"}}>{fmtDate(e.date)}</span>
+                          <span style={{fontSize:10,padding:"1px 6px",borderRadius:4,background:CAT_COLOR[e.category]+"22",color:CAT_COLOR[e.category],fontWeight:600}}>{e.category}</span>
+                        </div>
+                        {e.note&&<div style={{fontSize:11,color:"#475569",marginTop:3}}>📝 {e.note}</div>}
+                        {e.tags&&<div style={{fontSize:10,color:"#6366f1",marginTop:2}}>🏷️ {e.tags}</div>}
                       </div>
-                      {e.note&&<div style={{fontSize:11,color:"#475569",marginTop:3}}>📝 {e.note}</div>}
-                      {e.tags&&<div style={{fontSize:10,color:"#6366f1",marginTop:2}}>🏷️ {e.tags}</div>}
                     </div>
-                  </div>
-                  <div style={{textAlign:"right",flexShrink:0,marginLeft:10}}>
-                    <div style={{fontSize:15,fontWeight:800,color:"#f97316"}}>−{fmt(e.amount,cur)}</div>
-                    <div style={{display:"flex",gap:5,marginTop:6,justifyContent:"flex-end"}}>
-                      <button onClick={()=>handleEdit(e)} style={{padding:"4px 8px",borderRadius:7,background:"#1e293b",border:"1px solid #334155",color:"#818cf8",fontSize:11}}>✏️</button>
-                      <button onClick={()=>setModals(m=>({...m,deleteConfirm:e.id}))} style={{padding:"4px 8px",borderRadius:7,background:"#1e293b",border:"1px solid #334155",color:"#ef4444",fontSize:11}}>🗑️</button>
+                    <div style={{textAlign:"right",flexShrink:0,marginLeft:10}}>
+                      <div style={{fontSize:15,fontWeight:800,color:"#f97316"}}>−{fmt(e.amount,cur)}</div>
+                      <div style={{display:"flex",gap:5,marginTop:6,justifyContent:"flex-end"}}>
+                        <button onClick={()=>handleEdit(e)} style={{padding:"4px 8px",borderRadius:7,background:"#1e293b",border:"1px solid #334155",color:"#818cf8",fontSize:11}}>✏️</button>
+                        <button onClick={()=>setModals(m=>({...m,deleteConfirm:e.id}))} style={{padding:"4px 8px",borderRadius:7,background:"#1e293b",border:"1px solid #334155",color:"#ef4444",fontSize:11}}>🗑️</button>
+                      </div>
                     </div>
                   </div>
                 </div>
-              </div>
-            ))}
+              ))}
+            </>)}
+
+            {/* ── INCOME SUB-TAB ── */}
+            {historySubTab==="income"&&(<>
+              <button onClick={()=>openModal("income")} style={{width:"100%",padding:12,borderRadius:12,background:"linear-gradient(135deg,#10b981,#059669)",border:"none",color:"#fff",fontSize:13,fontWeight:700,marginBottom:12}}>+ Add Income</button>
+
+              {filteredIncomes.length>0&&(
+                <div style={{background:"#0f172a",border:"1px solid #1e293b",borderRadius:14,padding:"12px 16px",marginBottom:12,display:"flex",justifyContent:"space-between"}}>
+                  <span style={{fontSize:12,color:"#64748b"}}>{filteredIncomes.length} income entries</span>
+                  <span style={{fontSize:13,fontWeight:800,color:"#10b981"}}>{fmt(filtIncomeTotal,cur)}</span>
+                </div>
+              )}
+
+              {filteredIncomes.length===0&&<div style={{textAlign:"center",padding:"50px 20px",color:"#475569"}}><div style={{fontSize:40}}>💵</div><div style={{marginTop:10,color:"#64748b",fontWeight:600}}>No income recorded</div></div>}
+
+              {filteredIncomes.map(e=>(
+                <div key={e.id} style={{background:"#0f172a",border:"1px solid #1e293b",borderRadius:14,padding:"14px 16px",marginBottom:10}}>
+                  <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start"}}>
+                    <div style={{display:"flex",gap:10,alignItems:"center",flex:1,minWidth:0}}>
+                      <div style={{width:42,height:42,borderRadius:12,background:"#10b98122",display:"flex",alignItems:"center",justifyContent:"center",fontSize:20,flexShrink:0}}>{INCOME_ICON[e.category]}</div>
+                      <div style={{flex:1,minWidth:0}}>
+                        <div style={{fontSize:14,fontWeight:700,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{e.title}</div>
+                        <div style={{display:"flex",alignItems:"center",gap:5,marginTop:3,flexWrap:"wrap"}}>
+                          <span style={{fontSize:10,color:"#475569"}}>{fmtDate(e.date)}</span>
+                          <span style={{fontSize:10,padding:"1px 6px",borderRadius:4,background:"#10b98122",color:"#10b981",fontWeight:600}}>{e.category}</span>
+                        </div>
+                        {e.note&&<div style={{fontSize:11,color:"#475569",marginTop:3}}>📝 {e.note}</div>}
+                      </div>
+                    </div>
+                    <div style={{textAlign:"right",flexShrink:0,marginLeft:10}}>
+                      <div style={{fontSize:15,fontWeight:800,color:"#10b981"}}>+{fmt(e.amount,cur)}</div>
+                      <div style={{display:"flex",gap:5,marginTop:6,justifyContent:"flex-end"}}>
+                        <button onClick={()=>handleEditIncome(e)} style={{padding:"4px 8px",borderRadius:7,background:"#1e293b",border:"1px solid #334155",color:"#818cf8",fontSize:11}}>✏️</button>
+                        <button onClick={()=>setModals(m=>({...m,deleteIncomeConfirm:e.id}))} style={{padding:"4px 8px",borderRadius:7,background:"#1e293b",border:"1px solid #334155",color:"#ef4444",fontSize:11}}>🗑️</button>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </>)}
           </div>
         )}
 
